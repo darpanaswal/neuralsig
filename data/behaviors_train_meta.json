@@ -1,0 +1,42 @@
+{
+  "strategy": "split",
+  "n": 25,
+  "seed": 0,
+  "excluded_indices": {
+    "data/cybersecurity": [
+      788,
+      861,
+      1552,
+      1729,
+      1823
+    ],
+    "data/medical": [
+      82,
+      530,
+      829,
+      995,
+      1047
+    ],
+    "data/hate_harassment": [
+      621,
+      733,
+      976,
+      1605,
+      1699
+    ],
+    "data/general_crime": [
+      285,
+      447,
+      577,
+      1033,
+      1194
+    ],
+    "data/bioterrorism": [
+      388,
+      572,
+      2532,
+      3095,
+      3274
+    ]
+  }
+}
