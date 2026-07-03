@@ -598,7 +598,7 @@ if __name__ == "__main__":
     parser.add_argument("--splits", nargs="+", default=["harmful", "safe"])
     parser.add_argument("--transforms", nargs="+", default=None,
                         help="subset of transform names; default = all six")
-    parser.add_argument("--gcg_pool", default="gcg_suffix_pool.json",
+    parser.add_argument("--gcg_pool", default="data/gcg_suffix_pool.json",
                         help="path to generated gcg_suffix_pool.json")
     parser.add_argument("--exclude_meta", default=None,
                         help="behaviors_train_meta.json to hold out training behaviors")

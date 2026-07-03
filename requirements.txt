@@ -1,12 +1,13 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
-
+vllm==0.4.2
 numpy
 torch
-torchvision
-torchaudio
 datasets
+torchaudio
 accelerate
+torchvision
 scikit-learn
 transformers
 python-dotenv
 huggingface_hub
+transformers==4.40.2
