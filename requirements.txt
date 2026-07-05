@@ -1,4 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu121
+art
 vllm==0.4.2
 numpy
 torch

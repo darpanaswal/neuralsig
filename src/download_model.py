@@ -5,5 +5,5 @@ print(BASE_DIR)
 
 login(token=hf_token)
 
-REPO_ID = "meta-llama/Llama-3.2-3B-Instruct"
-snapshot_download(repo_id=REPO_ID, local_dir=f"{BASE_DIR}/models/Llama-3.2-3B-Instruct")
+REPO_ID = "meta-llama/Llama-Guard-4-12B"
+snapshot_download(repo_id=REPO_ID, local_dir=f"{BASE_DIR}/models/meta-llama/Llama-Guard-4-12B")

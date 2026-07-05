@@ -5,8 +5,8 @@ set -euo pipefail
 # CONFIGURE HERE
 ########################################
 
-EXPERIMENT="inference"
-MODEL_DIR="models/meta-llama/Llama-3.2-3B-Instruct/"
+EXPERIMENT="guard"
+GUARD_DIR="models/meta-llama/Llama-Guard-4-12B/"
 ENV="bioterrorism"
 
 # ENVIRONMENTS = [
@@ -14,13 +14,11 @@ ENV="bioterrorism"
 #     "general_crime", "bioterrorism",
 # ]
 
-# Number of GPUs to run in Data-Parallel mode
+# Data-parallel: one LG4 worker per GPU. V100 32GB fits 12B fp16 (~24GB).
 N_GPUS=8
 
-MAX_TOKENS=3000
-TEMPERATURE=0.0
-GPU_MEM_UTIL=0.85
-MAX_MODEL_LEN=40960
+BATCH_SIZE=2
+MAX_NEW_TOKENS=20
 DTYPE="float16"
 
 PARTITION="gpu_p2"
@@ -75,92 +73,89 @@ set -u
 : > "${LOG_FILE}"
 
 echo "========================================" | tee -a "${LOG_FILE}"
-echo "Batched vLLM inference (Data Parallelism)" | tee -a "${LOG_FILE}"
+echo "Llama-Guard-4 refusal scoring (Data Parallel)" | tee -a "${LOG_FILE}"
 echo "========================================" | tee -a "${LOG_FILE}"
 
-echo "SLURM Job ID    : ${SLURM_JOB_ID}" | tee -a "${LOG_FILE}"
+echo "SLURM Job ID    : ${SLURM_JOB_ID}"   | tee -a "${LOG_FILE}"
 echo "Node            : ${SLURMD_NODENAME}" | tee -a "${LOG_FILE}"
-echo "Partition       : ${SLURM_JOB_PARTITION}" | tee -a "${LOG_FILE}"
-echo "" | tee -a "${LOG_FILE}"
-
-echo "Environment     : ${ENV}" | tee -a "${LOG_FILE}"
-echo "Model           : ${MODEL_DIR}" | tee -a "${LOG_FILE}"
-echo "GPUs for DP     : ${N_GPUS}" | tee -a "${LOG_FILE}"
-echo "Max tokens      : ${MAX_TOKENS}" | tee -a "${LOG_FILE}"
-echo "Temperature     : ${TEMPERATURE}" | tee -a "${LOG_FILE}"
-echo "Log file        : ${LOG_FILE}" | tee -a "${LOG_FILE}"
+echo "Environment     : ${ENV}"            | tee -a "${LOG_FILE}"
+echo "Guard model     : ${GUARD_DIR}"      | tee -a "${LOG_FILE}"
+echo "GPUs for DP     : ${N_GPUS}"         | tee -a "${LOG_FILE}"
+echo "Batch size      : ${BATCH_SIZE}"     | tee -a "${LOG_FILE}"
 echo "----------------------------------------" | tee -a "${LOG_FILE}"
 
-# Safely extract the available GPUs provided by SLURM
+# Safely extract the GPUs SLURM gave us.
 IFS=',' read -ra AVAILABLE_GPUS <<< "${CUDA_VISIBLE_DEVICES:-0}"
 
-export NCCL_NET_PLUGIN=none
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-
 ########################################
-# Run Inference (Data Parallel shards)
+# Run scoring (one worker per GPU)
 ########################################
 
-echo "Launching ${N_GPUS} parallel vLLM workers..." | tee -a "${LOG_FILE}"
+echo "Launching ${N_GPUS} parallel LG4 workers..." | tee -a "${LOG_FILE}"
 
 for i in $(seq 0 $((N_GPUS - 1))); do
-    # Ensure we don't index past what SLURM gave us
     GPU_IDX=${AVAILABLE_GPUS[$((i % ${#AVAILABLE_GPUS[@]}))]}
-    
+
     SHARD_LOG="${LOG_DIR}/${ENV}_shard${i}.txt"
     echo " -> Worker $i assigned to GPU ${GPU_IDX}. Logging to ${SHARD_LOG}" | tee -a "${LOG_FILE}"
 
-    CUDA_VISIBLE_DEVICES="${GPU_IDX}" python -u run_inference.py \
+    CUDA_VISIBLE_DEVICES="${GPU_IDX}" python -u run_guard.py \
         --env "${ENV}" \
-        --model "${MODEL_DIR}" \
+        --guard_model "${GUARD_DIR}" \
         --num_shards "${N_GPUS}" \
         --shard_id "$i" \
-        --max_tokens "${MAX_TOKENS}" \
-        --temperature "${TEMPERATURE}" \
-        --gpu_mem_util "${GPU_MEM_UTIL}" \
-        --max_model_len "${MAX_MODEL_LEN}" \
+        --batch_size "${BATCH_SIZE}" \
+        --max_new_tokens "${MAX_NEW_TOKENS}" \
         --dtype "${DTYPE}" \
         > "${SHARD_LOG}" 2>&1 &
 done
 
-# Wait for all background workers to finish
 wait
 
-echo "All workers completed. Merging JSON shards..." | tee -a "${LOG_FILE}"
+echo "All workers done. Merging scored shards..." | tee -a "${LOG_FILE}"
 
 ########################################
-# Merge script to reconstruct JSON lists
+# Merge: fold <split>_scored_<shard>.json back into <split>.json in place.
+# Merge key is orig_index + transformed_prompt (transformed sets have variants).
 ########################################
 python -c "
 import json, glob
 from pathlib import Path
 
 env = '${ENV}'
-splits = ['base/harmful', 'base/safe', 'transformed/harmful', 'transformed/safe']
-out_dir = Path('outputs/responses') / env
+sets = ['base/harmful', 'base/safe', 'transformed/harmful', 'transformed/safe']
+root = Path('outputs/responses') / env
 
-for split in splits:
-    pattern = str(out_dir / f'{split}_*.json')
-    files = glob.glob(pattern)
-    if not files: 
+def key(e):
+    return (e.get('orig_index'), e.get('transformed_prompt'))
+
+for s in sets:
+    tgt = root / f'{s}.json'
+    if not tgt.exists():
+        continue
+    stem = tgt.stem
+    shards = glob.glob(str(tgt.parent / f'{stem}_scored_*.json'))
+    if not shards:
+        print(f'no scored shards for {s}; skipping')
         continue
 
-    data = []
-    for f in files:
-        with open(f, 'r') as fp:
-            data.extend(json.load(fp))
+    scored = {}
+    for f in shards:
+        for e in json.load(open(f)):
+            scored[key(e)] = e
 
-    # Sort deterministically by orig_index
-    data.sort(key=lambda x: x.get('orig_index', 0))
+    base = json.load(open(tgt))
+    hits = 0
+    for i, e in enumerate(base):
+        k = key(e)
+        if k in scored:
+            base[i] = scored[k]
+            hits += 1
 
-    out_path = out_dir / f'{split}.json'
-    with open(out_path, 'w') as fp:
-        json.dump(data, fp, indent=2, ensure_ascii=False)
+    json.dump(base, open(tgt, 'w'), indent=2, ensure_ascii=False)
+    print(f'{s}: merged {hits}/{len(base)} scored entries -> {tgt}')
 
-    print(f'Merged {len(files)} shards for {split} -> {out_path} ({len(data)} entries)')
-
-    # Clean up intermediate shards
-    for f in files:
+    for f in shards:
         Path(f).unlink()
 " | tee -a "${LOG_FILE}"
 
