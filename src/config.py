@@ -41,5 +41,9 @@ HARMFUL_ENVIRONMENTS = [
     "terrorism",
 ]
 
-MODEL_DIR = BASE_DIR / "model/meta-llama/Llama-3.2-1B-Instruct"
+LLAMA2 = BASE_DIR / "models/meta-llama/Llama-2-7b-chat-hf"
+LLAMA3 = BASE_DIR / "models/meta-llama/Llama-3.2-3B-Instruct"
+MISTRAL = BASE_DIR / "models/mistralai/Mistral-7B-Instruct-v0.3"
+GEMMA = BASE_DIR / "models/google/gemma-1.1-7b-it"
+GUARD_MODEL = BASE_DIR / "models/mistralai/Mistral-7B-Instruct-v0.3"
 OUTPUT_DIR = BASE_DIR / "outputs"

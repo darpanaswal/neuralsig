@@ -3,10 +3,12 @@
 run_guard.py — Llama-Guard-4 refusal scoring over inference outputs.
 
 Reads the response files produced by run_inference.py:
-    outputs/responses/<env>/base/harmful.json
-    outputs/responses/<env>/base/safe.json
-    outputs/responses/<env>/transformed/harmful.json
-    outputs/responses/<env>/transformed/safe.json
+    outputs/responses/<model>/<env>/base/harmful.json
+    outputs/responses/<model>/<env>/base/safe.json
+    outputs/responses/<model>/<env>/transformed/<type>/harmful.json
+    outputs/responses/<model>/<env>/transformed/<type>/safe.json
+where <type> is one jailbreak type folder per transform (dan, opposite_mode,
+payload_split, bon_augment, ...), discovered at runtime.
 
 For each entry it runs Llama-Guard-4 as an OUTPUT filter over the pair
 [user_prompt, assistant_response] and fills:
@@ -28,32 +30,49 @@ bash launcher merges them back into <split>.json.
 """
 
 import json
+import torch
 import argparse
 from pathlib import Path
 from typing import List, Optional, Tuple
-
-import torch
+from src.config import OUTPUT_DIR, GUARD_MODEL
 from transformers import AutoProcessor, Llama4ForConditionalGeneration
-
-from src.config import OUTPUT_DIR, MODEL_DIR
 
 
 # ── paths / defaults ────────────────────────────────────────────────
 OUT_ROOT = OUTPUT_DIR / "responses"
-DEFAULT_GUARD = MODEL_DIR.parent / "Llama-Guard-4-12B"
 
 ENVIRONMENTS = [
     "cybersecurity", "medical", "hate_harassment",
     "general_crime", "bioterrorism",
 ]
 
-# (subdir, split-file-stem) covering all four sets per env.
-SETS: List[Tuple[str, str]] = [
-    ("base", "harmful"),
-    ("base", "safe"),
-    ("transformed", "harmful"),
-    ("transformed", "safe"),
-]
+MODELS = ["llama2", "llama3", "mistral", "gemma"]
+
+SPLITS = ["harmful", "safe"]
+
+
+# bon_augment's random word-scrambling/noise produces too many garbled,
+# semantically-unrelated prompts to be useful for probe training - excluded
+# from every stage (generation, guard, judge, annotation).
+EXCLUDED_JAILBREAK_TYPES = {"bon_augment"}
+
+
+def discover_jailbreak_types(env_root: Path) -> List[str]:
+    """Jailbreak-type subfolders under <env_root>/transformed, e.g. dan,
+    opposite_mode, payload_split, ..."""
+    transformed_dir = env_root / "transformed"
+    if not transformed_dir.exists():
+        return []
+    return sorted(d.name for d in transformed_dir.iterdir()
+                  if d.is_dir() and d.name not in EXCLUDED_JAILBREAK_TYPES)
+
+
+def build_sets(env_root: Path) -> List[Tuple[str, str]]:
+    """(subdir, split-file-stem) pairs covering base + every jailbreak type."""
+    sets = [("base", split) for split in SPLITS]
+    for jb_type in discover_jailbreak_types(env_root):
+        sets += [(f"transformed/{jb_type}", split) for split in SPLITS]
+    return sets
 
 
 # ── IO helpers ──────────────────────────────────────────────────────
@@ -179,7 +198,9 @@ def score_file(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", required=True, choices=ENVIRONMENTS)
-    parser.add_argument("--guard_model", default=str(DEFAULT_GUARD),
+    parser.add_argument("--model", required=True, choices=MODELS,
+                        help="target model whose responses are being scored")
+    parser.add_argument("--guard_model", default=str(GUARD_MODEL),
                         help="path to local Llama-Guard-4-12B dir")
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--shard_id", type=int, default=0)
@@ -194,7 +215,7 @@ def main():
     args = parser.parse_args()
 
     env = args.env
-    env_root = OUT_ROOT / env
+    env_root = OUT_ROOT / args.model / env
 
     dtype = {"float16": torch.float16,
              "bfloat16": torch.bfloat16,
@@ -223,9 +244,9 @@ def main():
 
     # Left padding so the generated verdict is at a consistent offset.
     if getattr(processor, "tokenizer", None) is not None:
-        processor.tokenizer.padding_side = "left"
+        processor.tokenizer.padding_side = "right"
 
-    for subdir, split in SETS:
+    for subdir, split in build_sets(env_root):
         path = env_root / subdir / f"{split}.json"
         score_file(
             model, processor, path,

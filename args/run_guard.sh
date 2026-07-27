@@ -7,6 +7,7 @@ set -euo pipefail
 
 EXPERIMENT="guard"
 GUARD_DIR="models/meta-llama/Llama-Guard-4-12B/"
+MODEL="gemma"
 ENV="bioterrorism"
 
 # ENVIRONMENTS = [
@@ -15,7 +16,7 @@ ENV="bioterrorism"
 # ]
 
 # Data-parallel: one LG4 worker per GPU. V100 32GB fits 12B fp16 (~24GB).
-N_GPUS=8
+N_GPUS=2
 
 BATCH_SIZE=2
 MAX_NEW_TOKENS=20
@@ -57,12 +58,37 @@ fi
 ########################################
 set +u
 
+# ==============================================================================
+# SAFE SYMLINK TRICK: Protect $HOME quota from massive Pip/Conda installs
+# ==============================================================================
+# 1. Route ~/.config (used by vLLM for NCCL binaries)
+if [ ! -L "$HOME/.config" ]; then
+    mkdir -p "$WORK/.config"
+    # Copy contents if the directory exists and isn't empty, then remove the original
+    if [ -d "$HOME/.config" ]; then
+        cp -a "$HOME/.config/." "$WORK/.config/" 2>/dev/null || true
+        rm -rf "$HOME/.config"
+    fi
+    ln -s "$WORK/.config" "$HOME/.config"
+fi
+
+# 2. Route ~/.conda (used by Anaconda for massive environment binaries)
+if [ ! -L "$HOME/.conda" ]; then
+    mkdir -p "$WORK/.conda"
+    # Copy contents if the directory exists and isn't empty, then remove the original
+    if [ -d "$HOME/.conda" ]; then
+        cp -a "$HOME/.conda/." "$WORK/.conda/" 2>/dev/null || true
+        rm -rf "$HOME/.conda"
+    fi
+    ln -s "$WORK/.conda" "$HOME/.conda"
+fi
+# ==============================================================================
+
 cd "$WORK/neuralsig"
 module purge
-module load python/3.10.4
-
+module load anaconda-py3/2024.06
 source $WORK/env_cache_guard.sh
-source neusig/bin/activate
+conda activate neusig
 
 set -u
 
@@ -101,6 +127,7 @@ for i in $(seq 0 $((N_GPUS - 1))); do
 
     CUDA_VISIBLE_DEVICES="${GPU_IDX}" python -u run_guard.py \
         --env "${ENV}" \
+        --model "${MODEL}" \
         --guard_model "${GUARD_DIR}" \
         --num_shards "${N_GPUS}" \
         --shard_id "$i" \
@@ -123,8 +150,16 @@ import json, glob
 from pathlib import Path
 
 env = '${ENV}'
-sets = ['base/harmful', 'base/safe', 'transformed/harmful', 'transformed/safe']
-root = Path('outputs/responses') / env
+model = '${MODEL}'
+root = Path('outputs/responses') / model / env
+
+# Discover jailbreak-type subfolders under transformed/ (dan, opposite_mode,
+# payload_split, bon_augment, ...) rather than hardcoding them.
+jb_types = sorted(d.name for d in (root / 'transformed').iterdir() if d.is_dir()) \
+    if (root / 'transformed').exists() else []
+sets = ['base/harmful', 'base/safe'] + [
+    f'transformed/{t}/{s}' for t in jb_types for s in ('harmful', 'safe')
+]
 
 def key(e):
     return (e.get('orig_index'), e.get('transformed_prompt'))

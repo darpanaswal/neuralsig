@@ -3,17 +3,22 @@
 run_inference.py — batched vLLM inference over base + transformed prompt sets
 for one selected environment.
 
+Each jailbreak type produced by jailbreak_transforms/transform.py lives in
+its own folder (data/transformed/<type>/<env>_<split>.json, e.g. dan/,
+opposite_mode/, payload_split/, ...); this script discovers those folders
+and runs inference over every one of them, in addition to the base sets.
+
 Run order (sequential, single env, per shard):
-    1. base harmful          (all, sharded)
-    2. base safe             (all, sharded)
-    3. transformed harmful   (all, sharded)
-    4. transformed safe      (all, sharded)
+    1. base harmful                    (all, sharded)
+    2. base safe                       (all, sharded)
+    3. per jailbreak type: harmful     (all, sharded)
+    4. per jailbreak type: safe        (all, sharded)
 
 Outputs:
     outputs/responses/<env>/base/harmful_<shard_id>.json
     outputs/responses/<env>/base/safe_<shard_id>.json
-    outputs/responses/<env>/transformed/harmful_<shard_id>.json
-    outputs/responses/<env>/transformed/safe_<shard_id>.json
+    outputs/responses/<env>/transformed/<type>/harmful_<shard_id>.json
+    outputs/responses/<env>/transformed/<type>/safe_<shard_id>.json
 """
 
 import json
@@ -21,13 +26,14 @@ import argparse
 from pathlib import Path
 from typing import List, Optional
 from vllm import LLM, SamplingParams
-from src.config import DATA_DIR, MODEL_DIR, OUTPUT_DIR
+from src.config import DATA_DIR, LLAMA2, LLAMA3, MISTRAL, GEMMA, OUTPUT_DIR
 
 
 # ── paths / defaults (from config.py) ───────────────────────────────
 TRANSFORMED_DIR = DATA_DIR / "transformed"
 OUT_ROOT = OUTPUT_DIR / "responses"
-DEFAULT_MODEL = MODEL_DIR
+
+MODELS = ["llama2", "llama3", "mistral", "gemma"]
 
 ENVIRONMENTS = [
     "cybersecurity", "medical", "hate_harassment",
@@ -49,8 +55,26 @@ def load_base(env: str, split: str) -> List[str]:
     return load_json(DATA_DIR / f"{env}_{split}.json")
 
 
-def load_transformed(env: str, split: str) -> List[dict]:
-    return load_json(TRANSFORMED_DIR / f"{env}_{split}_transformed.json")
+# bon_augment's random word-scrambling/noise produces too many garbled,
+# semantically-unrelated prompts to be useful for probe training - excluded
+# from generation and every downstream stage (guard, judge, annotation).
+EXCLUDED_JAILBREAK_TYPES = {"bon_augment"}
+
+
+def discover_jailbreak_types(env: str, split: str) -> List[str]:
+    """Jailbreak-type subfolders under TRANSFORMED_DIR with data for this
+    env/split, e.g. dan, opposite_mode, payload_split, ..."""
+    if not TRANSFORMED_DIR.exists():
+        return []
+    return sorted(
+        d.name for d in TRANSFORMED_DIR.iterdir()
+        if d.is_dir() and d.name not in EXCLUDED_JAILBREAK_TYPES
+        and (d / f"{env}_{split}.json").exists()
+    )
+
+
+def load_transformed(env: str, split: str, jb_type: str) -> List[dict]:
+    return load_json(TRANSFORMED_DIR / jb_type / f"{env}_{split}.json")
 
 
 # ── prompt formatting ───────────────────────────────────────────────
@@ -119,12 +143,12 @@ def run_base_split(
 
 
 def run_transformed_split(
-    llm, sampling, tokenizer, env: str, split: str,
+    llm, sampling, tokenizer, env: str, split: str, jb_type: str,
     base_raw: List[str],
     keep_indices: Optional[List[int]] = None,
     debug: bool = False,
 ) -> List[dict]:
-    records = load_transformed(env, split)
+    records = load_transformed(env, split, jb_type)
     if keep_indices is not None:
         keep = set(keep_indices)
         records = [r for r in records if r["orig_index"] in keep]
@@ -140,7 +164,7 @@ def run_transformed_split(
     responses = generate(llm, sampling, rendered)
 
     if debug:
-        print(f"\n{'='*20} DEBUG: TRANSFORMED {split.upper()} {'='*20}")
+        print(f"\n{'='*20} DEBUG: {jb_type.upper()} {split.upper()} {'='*20}")
         for t, r in zip(transformed_texts, responses):
             print(f"TRANSFORMED PROMPT: {t}\nRESPONSE: {r}\n{'-'*50}")
         print("="*65 + "\n")
@@ -153,8 +177,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", required=True, choices=ENVIRONMENTS,
                         help="environment to run inference for")
-    parser.add_argument("--model", default=str(DEFAULT_MODEL),
-                        help="path to local HF model dir for vLLM")
+    parser.add_argument("--model", required=True, choices=MODELS,
+                        help="model to run inference on")
     parser.add_argument("--num_shards", type=int, default=1,
                         help="Total number of data-parallel workers")
     parser.add_argument("--shard_id", type=int, default=0,
@@ -169,7 +193,15 @@ def main():
     args = parser.parse_args()
 
     env = args.env
-    out_dir = OUT_ROOT / env
+    out_dir = OUT_ROOT / f"{args.model}/{env}"
+    if args.model == "llama2":
+        args.model = LLAMA2
+    elif args.model == "llama3":
+        args.model = LLAMA3
+    elif args.model == "mistral":
+        args.model = MISTRAL
+    elif args.model == "gemma":
+        args.model = GEMMA
 
     print(f"Loading vLLM model: {args.model} on Shard {args.shard_id}/{args.num_shards}")
     # Force tensor_parallel_size=1 since we are scaling via Data Parallelism instead
@@ -202,24 +234,28 @@ def main():
     print(f"[{env} | Shard {args.shard_id}] Processing {len(my_harmful_indices)} harmful, {len(my_safe_indices)} safe prompts.")
 
     # 1. base harmful
-    print(f"[{env} | Shard {args.shard_id}] 1/4 base harmful ...")
+    print(f"[{env} | Shard {args.shard_id}] base harmful ...")
     e = run_base_split(llm, sampling, tokenizer, env, "harmful", keep_indices=my_harmful_indices, debug=args.debug)
     write_json(out_dir / "base" / f"harmful_{args.shard_id}.json", e)
 
     # 2. base safe
-    print(f"[{env} | Shard {args.shard_id}] 2/4 base safe ...")
+    print(f"[{env} | Shard {args.shard_id}] base safe ...")
     e = run_base_split(llm, sampling, tokenizer, env, "safe", keep_indices=my_safe_indices, debug=args.debug)
     write_json(out_dir / "base" / f"safe_{args.shard_id}.json", e)
 
-    # 3. transformed harmful
-    print(f"[{env} | Shard {args.shard_id}] 3/4 transformed harmful ...")
-    e = run_transformed_split(llm, sampling, tokenizer, env, "harmful", base_raw=base_harmful_raw, keep_indices=my_harmful_indices, debug=args.debug)
-    write_json(out_dir / "transformed" / f"harmful_{args.shard_id}.json", e)
+    # 3/4. one pass per discovered jailbreak type, harmful then safe
+    harmful_types = discover_jailbreak_types(env, "harmful")
+    safe_types = discover_jailbreak_types(env, "safe")
 
-    # 4. transformed safe
-    print(f"[{env} | Shard {args.shard_id}] 4/4 transformed safe ...")
-    e = run_transformed_split(llm, sampling, tokenizer, env, "safe", base_raw=base_safe_raw, keep_indices=my_safe_indices, debug=args.debug)
-    write_json(out_dir / "transformed" / f"safe_{args.shard_id}.json", e)
+    for jb_type in harmful_types:
+        print(f"[{env} | Shard {args.shard_id}] transformed/{jb_type} harmful ...")
+        e = run_transformed_split(llm, sampling, tokenizer, env, "harmful", jb_type, base_raw=base_harmful_raw, keep_indices=my_harmful_indices, debug=args.debug)
+        write_json(out_dir / "transformed" / jb_type / f"harmful_{args.shard_id}.json", e)
+
+    for jb_type in safe_types:
+        print(f"[{env} | Shard {args.shard_id}] transformed/{jb_type} safe ...")
+        e = run_transformed_split(llm, sampling, tokenizer, env, "safe", jb_type, base_raw=base_safe_raw, keep_indices=my_safe_indices, debug=args.debug)
+        write_json(out_dir / "transformed" / jb_type / f"safe_{args.shard_id}.json", e)
 
     print(f"[{env} | Shard {args.shard_id}] Done.")
 

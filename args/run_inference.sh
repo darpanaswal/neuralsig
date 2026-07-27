@@ -6,7 +6,7 @@ set -euo pipefail
 ########################################
 
 EXPERIMENT="inference"
-MODEL_DIR="models/meta-llama/Llama-3.2-3B-Instruct/"
+MODEL="gemma"
 ENV="bioterrorism"
 
 # ENVIRONMENTS = [
@@ -15,12 +15,12 @@ ENV="bioterrorism"
 # ]
 
 # Number of GPUs to run in Data-Parallel mode
-N_GPUS=8
+N_GPUS=4
 
 MAX_TOKENS=3000
 TEMPERATURE=0.0
 GPU_MEM_UTIL=0.85
-MAX_MODEL_LEN=40960
+MAX_MODEL_LEN=4096
 DTYPE="float16"
 
 PARTITION="gpu_p2"
@@ -59,12 +59,37 @@ fi
 ########################################
 set +u
 
+# ==============================================================================
+# SAFE SYMLINK TRICK: Protect $HOME quota from massive Pip/Conda installs
+# ==============================================================================
+# 1. Route ~/.config (used by vLLM for NCCL binaries)
+if [ ! -L "$HOME/.config" ]; then
+    mkdir -p "$WORK/.config"
+    # Copy contents if the directory exists and isn't empty, then remove the original
+    if [ -d "$HOME/.config" ]; then
+        cp -a "$HOME/.config/." "$WORK/.config/" 2>/dev/null || true
+        rm -rf "$HOME/.config"
+    fi
+    ln -s "$WORK/.config" "$HOME/.config"
+fi
+
+# 2. Route ~/.conda (used by Anaconda for massive environment binaries)
+if [ ! -L "$HOME/.conda" ]; then
+    mkdir -p "$WORK/.conda"
+    # Copy contents if the directory exists and isn't empty, then remove the original
+    if [ -d "$HOME/.conda" ]; then
+        cp -a "$HOME/.conda/." "$WORK/.conda/" 2>/dev/null || true
+        rm -rf "$HOME/.conda"
+    fi
+    ln -s "$WORK/.conda" "$HOME/.conda"
+fi
+# ==============================================================================
+
 cd "$WORK/neuralsig"
 module purge
-module load python/3.10.4
-
+module load anaconda-py3/2024.06
 source $WORK/env_cache_guard.sh
-source neusig/bin/activate
+conda activate neusig
 
 set -u
 
@@ -84,7 +109,6 @@ echo "Partition       : ${SLURM_JOB_PARTITION}" | tee -a "${LOG_FILE}"
 echo "" | tee -a "${LOG_FILE}"
 
 echo "Environment     : ${ENV}" | tee -a "${LOG_FILE}"
-echo "Model           : ${MODEL_DIR}" | tee -a "${LOG_FILE}"
 echo "GPUs for DP     : ${N_GPUS}" | tee -a "${LOG_FILE}"
 echo "Max tokens      : ${MAX_TOKENS}" | tee -a "${LOG_FILE}"
 echo "Temperature     : ${TEMPERATURE}" | tee -a "${LOG_FILE}"
@@ -112,7 +136,7 @@ for i in $(seq 0 $((N_GPUS - 1))); do
 
     CUDA_VISIBLE_DEVICES="${GPU_IDX}" python -u run_inference.py \
         --env "${ENV}" \
-        --model "${MODEL_DIR}" \
+        --model "${MODEL}" \
         --num_shards "${N_GPUS}" \
         --shard_id "$i" \
         --max_tokens "${MAX_TOKENS}" \
@@ -136,8 +160,16 @@ import json, glob
 from pathlib import Path
 
 env = '${ENV}'
-splits = ['base/harmful', 'base/safe', 'transformed/harmful', 'transformed/safe']
-out_dir = Path('outputs/responses') / env
+model = '${MODEL}'
+out_dir = Path('outputs/responses') / model / env
+
+# Discover jailbreak-type subfolders written under transformed/ (dan,
+# opposite_mode, payload_split, bon_augment, ...) rather than hardcoding them.
+jb_types = sorted(d.name for d in (out_dir / 'transformed').iterdir() if d.is_dir()) \
+    if (out_dir / 'transformed').exists() else []
+splits = ['base/harmful', 'base/safe'] + [
+    f'transformed/{t}/{s}' for t in jb_types for s in ('harmful', 'safe')
+]
 
 for split in splits:
     pattern = str(out_dir / f'{split}_*.json')
