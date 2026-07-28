@@ -3,3 +3,5 @@ __pycache__
 runs
 models
 neusig
+models/
+**/.cache/

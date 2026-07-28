@@ -13,6 +13,9 @@ Reports:
   - ICC(2,1): two-way random effects, absolute agreement, single rater
   - ICC(3,1): two-way mixed effects, consistency, single rater
   - pairwise Cohen's kappa for every rater pair, as a sanity cross-check
+  - the same three, broken out per judge_score class (0/1/2/3), using
+    judge_score as the class label for each subject regardless of whether
+    the judge column itself is included as a rater (--no_judge)
 
 Usage:
     python compute_icc.py --model gemma \
@@ -30,7 +33,7 @@ from typing import Dict, List
 
 import numpy as np
 
-from run_judge import OUT_ROOT, ENVIRONMENTS, build_sets
+from run_judge import OUT_ROOT, ENVIRONMENTS, build_sets, LABELS
 
 
 # ── loaders ─────────────────────────────────────────────────────────
@@ -100,6 +103,24 @@ def pairwise_kappa(columns: Dict[str, List[int]]) -> None:
             print(f"  Cohen's kappa [{names[i]} vs {names[j]}]: {kappa:.3f}")
 
 
+def report_agreement(raters: Dict[str, Dict[str, int]], keys: List[str]) -> None:
+    """Print ICC(2,1)/ICC(3,1) and pairwise kappa for `raters` restricted to `keys`."""
+    if len(keys) < 2:
+        print("  not enough overlapping entries to compute ICC.")
+        return
+    names = list(raters)
+    data = np.array([[raters[name][k] for name in names] for k in keys], dtype=float)
+
+    icc = icc_2_1_and_3_1(data)
+    print(f"  n_subjects={data.shape[0]}  n_raters={data.shape[1]}")
+    for name, val in icc.items():
+        print(f"  {name}: {val:.3f}")
+
+    print("  Pairwise Cohen's kappa:")
+    columns = {name: data[:, i].astype(int).tolist() for i, name in enumerate(names)}
+    pairwise_kappa(columns)
+
+
 # ── main ────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
@@ -117,12 +138,15 @@ def main():
         path = Path(path_str)
         raters[path.stem] = load_annotation_file(path)
 
+    # judge_score is always pulled to use as each subject's class label for
+    # the per-class breakdown, even when --no_judge excludes it as a rater.
+    judge_scores = collect_judge_scores(args.model)
+    if not judge_scores:
+        print(f"No judge_score found for model={args.model} "
+              f"(run run_judge.py first). Aborting.")
+        return
+
     if not args.no_judge:
-        judge_scores = collect_judge_scores(args.model)
-        if not judge_scores:
-            print(f"No judge_score found for model={args.model} "
-                  f"(run run_judge.py first, or pass --no_judge). Aborting.")
-            return
         raters["llm_judge"] = judge_scores
 
     if len(raters) < 2:
@@ -130,6 +154,7 @@ def main():
         return
 
     common_keys = set.intersection(*(set(r) for r in raters.values()))
+    common_keys &= set(judge_scores)  # need a class label for every subject
     print(f"Raters: {list(raters)}")
     print(f"Common labeled entries across all raters: {len(common_keys)}")
     if len(common_keys) < 2:
@@ -137,17 +162,15 @@ def main():
         return
 
     keys_sorted = sorted(common_keys)
-    names = list(raters)
-    data = np.array([[raters[name][k] for name in names] for k in keys_sorted], dtype=float)
 
-    icc = icc_2_1_and_3_1(data)
-    print(f"\nn_subjects={data.shape[0]}  n_raters={data.shape[1]}")
-    for name, val in icc.items():
-        print(f"{name}: {val:.3f}")
+    print(f"\n=== Overall ===")
+    report_agreement(raters, keys_sorted)
 
-    print("\nPairwise Cohen's kappa:")
-    columns = {name: data[:, i].astype(int).tolist() for i, name in enumerate(names)}
-    pairwise_kappa(columns)
+    print(f"\n=== Per judge_score class ===")
+    for score, name in LABELS.items():
+        class_keys = [k for k in keys_sorted if judge_scores[k] == score]
+        print(f"\n-- class {score} ({name}), n={len(class_keys)} --")
+        report_agreement(raters, class_keys)
 
 
 if __name__ == "__main__":
