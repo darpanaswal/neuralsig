@@ -26,10 +26,15 @@ JUDGE_MODEL=""          # default: gpt-4o-mini (openai) / LLAMA3 path (local)
 CONCURRENCY=8            # openai backend: parallel API requests
 BATCH_SIZE=8
 
-PARTITION="cpu_p1"       # CPU-only partition: no GPU held, so this job
-                         # doesn't compete for GPU allocations with others.
+ACCOUNT="plz@v100"       # this project only has a V100 GPU-hour allocation;
+                         # no separate CPU allocation exists. prepost jobs
+                         # don't draw on it (shared, effectively free), so
+                         # this account is still correct here.
+PARTITION="prepost"      # prepost nodes have internet access (needed for the
+                         # openai backend's API calls); cpu_p1/compute nodes
+                         # don't. Also CPU-only, so no GPU is held.
 N_CPUS=4
-WALLTIME="12:00:00"
+WALLTIME="12:00:00"      # prepost caps walltime at 20:00:00 — lower if needed.
 
 ########################################
 
@@ -48,6 +53,7 @@ if [ -z "${SLURM_JOB_ID:-}" ]; then
     sbatch \
         --job-name="${EXPERIMENT}_${MODEL}_${ENV}" \
         --output="${LOG_FILE}" \
+        --account="${ACCOUNT}" \
         --partition="${PARTITION}" \
         --nodes=1 \
         --ntasks=1 \

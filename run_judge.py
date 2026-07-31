@@ -35,6 +35,24 @@ re-running the same command resumes rather than restarts. Pass --rescore to
 force every entry to be re-judged from scratch. Requires run_guard.py to
 have already filled lg_verdict (entries missing it are skipped with a
 warning).
+
+
+Usage:-
+
+1. Setup terminal
+
+ssh jeanzay
+cd "$WORK/neuralsig"
+module purge
+module load anaconda-py3/2024.06
+source $WORK/env_cache_guard.sh
+conda activate neusig
+
+2. Run judge on a single shard of a single env, model, and set:
+# JAILBREAKS = ["base", "dan", "opposite_mode", "artprompt", "payload_split", "prefix_injection"]
+
+python run_judge.py --rescore --env cybersecurity --sets "prefix_injection" --model gemma --backend openai
+
 """
 
 import os
@@ -55,6 +73,8 @@ ENVIRONMENTS = [
     "cybersecurity", "medical", "hate_harassment",
     "general_crime", "bioterrorism",
 ]
+
+
 
 MODELS = ["llama2", "llama3", "mistral", "gemma"]
 
